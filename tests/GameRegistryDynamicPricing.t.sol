@@ -1,0 +1,378 @@
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity 0.8.24;
+
+import "forge-std/Test.sol";
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "../contracts/GameRegistry.sol";
+
+// Minimal mintable TIMBS for escrow.
+contract MockTIMBS is ERC20 {
+    bool public paused; // TS-031: stand-in for TIMBSToken.pause()
+    constructor() ERC20("TIMBS", "TIMBS") {}
+    function mint(address to, uint256 a) external { _mint(to, a); }
+    function setPaused(bool p) external { paused = p; }
+    function _update(address from, address to, uint256 v) internal override {
+        require(!paused, "paused");
+        super._update(from, to, v);
+    }
+}
+
+/**
+ * @title GameRegistry v5 — dynamic entry pricing tests
+ * @notice Exercises the per-round-fixed, both-ways-floating entry costs and the
+ *         pricing-meter invariants:
+ *           ETH   = escrow <= 1.1 ETH ? 0.001 ETH : escrow / 1000
+ *           TIMBS = TIMBS_ENTRY_FLOOR + activeTimbEntries * TIMBS_STEP, both set
+ *                   at deploy, re-fixed only outside a +/-2 deadband
+ *         plus seat conservation (+1 at submit, -1 at exactly one terminal exit;
+ *         concession net-neutral; expiry not terminal) and generation resets.
+ *
+ * The test contract is set as `timbPrize`, so it can drive the round lifecycle
+ * (setCurrentRound / activateRoundEntries / onRoundSettled / onGameStarted).
+ * yieldVault is left unset (address(0)) so the vault hooks are inert.
+ */
+contract GameRegistryDynamicPricingTest is Test {
+    MockTIMBS timbs;
+    GameRegistry reg;
+
+    address constant SINK = address(0xFEE);
+
+    bytes6 constant S1 = bytes6("ABC123");
+    bytes6 constant S2 = bytes6("DEF456");
+
+    uint256 constant ETH_FLOOR = 0.001 ether; // ETH_ENTRY_FLOOR
+    uint256 constant TIMBS_FLOOR = 2e18;       // TIMBS_ENTRY_FLOOR
+
+    function setUp() public {
+        timbs = new MockTIMBS();
+        reg = new GameRegistry(address(timbs), SINK, address(this), 2e18, 1e18);
+        reg.setTimbsEntryEnabled(true); // TIMBS leg is off by default (ETH-only beta)
+    }
+
+    // ─── helpers ─────────────────────────────────────────────────────────────
+
+    function _fundTimbs(address who) internal {
+        timbs.mint(who, 1_000_000e18);
+        vm.prank(who);
+        timbs.approve(address(reg), type(uint256).max);
+    }
+
+    function _timbsEntry(address who, bytes6 s) internal {
+        _fundTimbs(who);
+        vm.prank(who);
+        reg.submitEntry(s, false, 0);
+    }
+
+    function _ethEntry(address who, bytes6 s) internal {
+        vm.deal(who, 1 ether);
+        vm.prank(who);
+        reg.submitEntry{value: ETH_FLOOR}(s, true, 0);
+    }
+
+    function _one(address a) internal pure returns (address[] memory arr) {
+        arr = new address[](1);
+        arr[0] = a;
+    }
+
+    // ─── TIMBS pricing ─────────────────────────────────────────────────────────
+
+    // ─── deploy-time TIMBS pricing (immutable floor / step) ──────────────────
+
+    function test_ConstructorStoresPricing() public view {
+        assertEq(reg.TIMBS_ENTRY_FLOOR(), 2e18, "floor stored");
+        assertEq(reg.TIMBS_STEP(), 1e18, "step stored");
+    }
+
+    function test_ConstructorRejectsZeroFloor() public {
+        vm.expectRevert(abi.encodeWithSelector(GameRegistry.InvalidTimbsPricing.selector, 0, 1e18));
+        new GameRegistry(address(timbs), SINK, address(this), 0, 1e18);
+    }
+
+    function test_ConstructorRejectsZeroStep() public {
+        vm.expectRevert(abi.encodeWithSelector(GameRegistry.InvalidTimbsPricing.selector, 2e18, 0));
+        new GameRegistry(address(timbs), SINK, address(this), 2e18, 0);
+    }
+
+    function test_ConstructorRejectsStepAboveFloor() public {
+        vm.expectRevert(abi.encodeWithSelector(GameRegistry.InvalidTimbsPricing.selector, 2e18, 3e18));
+        new GameRegistry(address(timbs), SINK, address(this), 2e18, 3e18);
+    }
+
+    // Mainnet values (500 / 100) at the 1e-6 ETH/TIMBS launch price. The floor is
+    // deliberately BELOW the ETH leg — paying in TIMBS is half price at launch —
+    // and congestion, not the floor, is what closes the gap.
+    function test_MainnetPricing_HalfEthFloorAndCrossover() public {
+        GameRegistry m = new GameRegistry(address(timbs), SINK, address(this), 500e18, 100e18);
+        assertEq(m.entryCostTIMBS(), 500e18, "mainnet floor quote");
+
+        uint256 weiPerTimbs = 1e12; // 1e-6 ETH per whole TIMBS
+
+        // 500 TIMBS = 0.0005 ETH = half an ETH ticket.
+        assertEq(
+            (m.TIMBS_ENTRY_FLOOR() / 1e18) * weiPerTimbs,
+            ETH_FLOOR / 2,
+            "TIMBS floor is half the ETH-leg floor at the launch price"
+        );
+
+        // At five concurrent TIMBS entries the leg costs exactly an ETH ticket;
+        // past that it is the dearer route.
+        uint256 atFive = m.TIMBS_ENTRY_FLOOR() + 5 * m.TIMBS_STEP();
+        assertEq((atFive / 1e18) * weiPerTimbs, ETH_FLOOR, "parity at five concurrent entries");
+        assertGt(
+            m.TIMBS_ENTRY_FLOOR() + 6 * m.TIMBS_STEP(),
+            atFive,
+            "keeps climbing past the crossover"
+        );
+    }
+
+    function test_TimbsFloor_FirstEntryIsTwo() public {
+        // Quoted before any entry: the floor.
+        assertEq(reg.entryCostTIMBS(), TIMBS_FLOOR, "quote floor");
+
+        _timbsEntry(address(0xA1), S1);
+
+        assertEq(reg.activeTimbEntries(), 1, "meter +1");
+        assertEq(reg.fixedTimbsCost(), TIMBS_FLOOR, "fixed at floor");
+        assertEq(reg.pricedForRound(), 1, "priced for playRound 1");
+        assertEq(reg.entryCostTIMBS(), TIMBS_FLOOR, "locked for the round");
+        assertEq(timbs.balanceOf(address(reg)), TIMBS_FLOOR, "escrow held");
+    }
+
+    // Count drifts by 1 across a round → within the +/-2 deadband → price holds.
+    function test_TimbsDeadband_Holds() public {
+        _timbsEntry(address(0xA1), S1);       // active 1, fixed 2, ref 0
+        assertEq(reg.timbsPriceRefCount(), 0);
+
+        reg.setCurrentRound(1);
+        (, uint256 timbsNext) = reg.nextRoundPrices();
+        assertEq(timbsNext, TIMBS_FLOOR, "held (drift 1 < 2)");
+
+        _timbsEntry(address(0xA2), S1);
+        assertEq(reg.fixedTimbsCost(), TIMBS_FLOOR, "still 2");
+        assertEq(reg.timbsPriceRefCount(), 0, "ref unchanged");
+        assertEq(reg.activeTimbEntries(), 2);
+    }
+
+    // Count drifts by >=2 → deadband breached → price steps to 2 + active.
+    function test_TimbsDeadband_Steps() public {
+        _timbsEntry(address(0xA1), S1);
+        _timbsEntry(address(0xA2), S1);
+        _timbsEntry(address(0xA3), S1);       // active 3, fixed 2 (locked round 1), ref 0
+        assertEq(reg.activeTimbEntries(), 3);
+        assertEq(reg.fixedTimbsCost(), TIMBS_FLOOR);
+
+        reg.setCurrentRound(1);
+        (, uint256 timbsNext) = reg.nextRoundPrices();
+        assertEq(timbsNext, 5e18, "stepped: 2 + 3");
+
+        _timbsEntry(address(0xA4), S1);
+        assertEq(reg.fixedTimbsCost(), 5e18, "re-fixed");
+        assertEq(reg.timbsPriceRefCount(), 3, "ref = active at fix");
+        assertEq(reg.activeTimbEntries(), 4);
+    }
+
+    // ─── ETH pricing ─────────────────────────────────────────────────────────
+
+    function test_EthFloor_UnderThreshold() public {
+        assertEq(reg.entryCostETH(), ETH_FLOOR, "quote floor");
+
+        _ethEntry(address(0xB1), S1);
+        assertEq(reg.totalEthEscrow(), ETH_FLOOR, "escrow += cost");
+        assertEq(reg.fixedEthCost(), ETH_FLOOR, "fixed at floor");
+
+        reg.setCurrentRound(1);
+        (uint256 ethNext,) = reg.nextRoundPrices();
+        assertEq(ethNext, ETH_FLOOR, "still floor under 1.1 ETH");
+    }
+
+    // Push escrow above the 1.1 ETH threshold (all pay the round's locked floor),
+    // then the next round re-prices to escrow / 1000.
+    function test_EthScales_AboveThreshold() public {
+        uint256 n = 1101; // 1101 * 0.001 = 1.101 ETH > 1.1 ETH
+        // Spread across 12 strings ("GABCDE".."RABCDE"): the per-string entrant
+        // cap (default 100) would otherwise stop a 1101-deep stack on one string.
+        for (uint256 i = 0; i < n; i++) {
+            bytes6 s = bytes6(bytes.concat(bytes1(uint8(0x47 + i % 12)), bytes5("ABCDE")));
+            _ethEntry(address(uint160(0xC0000 + i)), s);
+        }
+        uint256 escrow = n * ETH_FLOOR;
+        assertEq(reg.totalEthEscrow(), escrow, "escrow summed");
+        assertEq(reg.fixedEthCost(), ETH_FLOOR, "round 0 stayed on the floor (locked)");
+
+        reg.setCurrentRound(1);
+        (uint256 ethNext,) = reg.nextRoundPrices();
+        assertEq(ethNext, escrow / 1000, "re-priced: escrow / 1000");
+        assertGt(ethNext, ETH_FLOOR, "scaled above the floor");
+    }
+
+    // ─── Seat conservation ─────────────────────────────────────────────────────
+
+    function test_Seat_TimbsCancelDecrements() public {
+        _timbsEntry(address(0xA1), S1);
+        assertEq(reg.activeTimbEntries(), 1);
+        vm.prank(address(0xA1));
+        reg.cancelEntry();
+        assertEq(reg.activeTimbEntries(), 0, "cancel releases the seat");
+    }
+
+    function test_Seat_EthCancelDecrements() public {
+        _ethEntry(address(0xB1), S1);
+        assertEq(reg.totalEthEscrow(), ETH_FLOOR);
+        vm.prank(address(0xB1));
+        reg.cancelEntry();
+        assertEq(reg.totalEthEscrow(), 0, "cancel releases the ETH escrow");
+    }
+
+    // Replace concedes the senior ticket and carries its seat to the replacement
+    // → the meter must not move; the replacement's own exit releases it once.
+    function test_Seat_ConcessionNetNeutral() public {
+        _fundTimbs(address(0xA1));
+        vm.prank(address(0xA1));
+        reg.submitEntry(S1, false, 0);
+        assertEq(reg.activeTimbEntries(), 1);
+
+        vm.prank(address(0xA1));
+        reg.replaceEntry(S2, 0);
+        assertEq(reg.activeTimbEntries(), 1, "concession is net-neutral");
+
+        vm.prank(address(0xA1));
+        reg.cancelEntry();
+        assertEq(reg.activeTimbEntries(), 0, "replacement exit releases once");
+    }
+
+    // Refund is a terminal exit → releases. Expiry (onRoundSettled) is NOT, so the
+    // seat is still counted through the refund window until refund/forfeit.
+    function test_Seat_RefundDecrements_ExpiryDoesNot() public {
+        _fundTimbs(address(0xA1));
+        vm.prank(address(0xA1));
+        reg.submitEntry(S1, false, 0); // ticket id 1, LER 1, forfeit at 5
+
+        reg.setCurrentRound(1);
+        reg.activateRoundEntries(1, _one(address(0xA1)));
+
+        reg.setCurrentRound(2);
+        reg.onRoundSettled(1, 0); // H2: paginated (0 = do all); expiry — NOT terminal
+        assertEq(reg.activeTimbEntries(), 1, "expiry keeps the seat counted");
+
+        vm.prank(address(0xA1));
+        reg.claimRefund(1);
+        assertEq(reg.activeTimbEntries(), 0, "refund releases the seat");
+    }
+
+    // Forfeit (unclaimed past the window) is the other terminal exit → releases.
+    function test_Seat_ForfeitDecrements() public {
+        _fundTimbs(address(0xA1));
+        vm.prank(address(0xA1));
+        reg.submitEntry(S1, false, 0); // LER 1, forfeit at 5
+
+        reg.setCurrentRound(1);
+        reg.activateRoundEntries(1, _one(address(0xA1)));
+
+        reg.setCurrentRound(6); // H2: round 5 is "settled" once currentRound > 5
+        reg.onRoundSettled(5, 0); // forfeitRound == 5 → Ineligible, escrow to sink
+        assertEq(reg.activeTimbEntries(), 0, "forfeit releases the seat");
+        assertEq(timbs.balanceOf(SINK), TIMBS_FLOOR, "escrow absorbed to sink");
+    }
+
+    // TS-031: a failing TIMBS sink transfer must not revert the sweep. The
+    // ticket keeps its escrow for a later admin refund; settlement completes.
+    function test_TS031_ForfeitSurvivesFailingTimbsTransfer() public {
+        _fundTimbs(address(0xA1));
+        vm.prank(address(0xA1));
+        reg.submitEntry(S1, false, 0);
+        uint256 id = reg.activeTicketOf(address(0xA1));
+        reg.setCurrentRound(1);
+        reg.activateRoundEntries(1, _one(address(0xA1)));
+        reg.setCurrentRound(6);
+
+        timbs.setPaused(true);
+        assertTrue(reg.onRoundSettled(5, 0), "sweep completes despite the failing leg");
+        assertEq(timbs.balanceOf(SINK), 0, "nothing moved");
+        (GameRegistry.Ticket memory t,) = reg.getTicket(id);
+        assertEq(uint8(t.status), uint8(GameRegistry.TicketStatus.Ineligible));
+        assertEq(t.escrowAmount, TIMBS_FLOOR, "escrow stays on the ticket");
+        assertEq(reg.activeTimbEntries(), 0, "seat released");
+    }
+
+    // H2: onRoundSettled is paginated — the cursor resumes across chunked calls,
+    // forfeits each entrant exactly once, and only flips settleDone when the whole
+    // scan is consumed. This is the DoS fix: a large entrant set is drained in
+    // bounded chunks instead of one settle-time loop that could OOG-freeze the game.
+    function test_Paginated_ForfeitureResumesAcrossChunks() public {
+        address[3] memory who = [address(0xA1), address(0xA2), address(0xA3)];
+        for (uint256 i; i < 3; i++) _timbsEntry(who[i], S1); // each LER 1, forfeit at 5
+
+        reg.setCurrentRound(1);
+        for (uint256 i; i < 3; i++) reg.activateRoundEntries(1, _one(who[i]));
+        assertEq(reg.activeTimbEntries(), 3, "3 seats");
+
+        reg.setCurrentRound(6); // round 5 settled
+
+        uint256 gen = reg.generation();
+
+        assertFalse(reg.onRoundSettled(5, 1), "chunk 1 not done");
+        assertFalse(reg.settleDone(gen, 5), "not marked done mid-scan");
+        assertEq(reg.activeTimbEntries(), 2, "one forfeited");
+
+        assertFalse(reg.onRoundSettled(5, 1), "chunk 2 not done");
+        assertEq(reg.activeTimbEntries(), 1, "two forfeited");
+
+        assertTrue(reg.onRoundSettled(5, 1), "final chunk completes");
+        assertTrue(reg.settleDone(gen, 5), "marked done");
+        assertEq(reg.activeTimbEntries(), 0, "all forfeited");
+        assertGe(timbs.balanceOf(SINK), 3 * TIMBS_FLOOR, "all escrow to sink");
+
+        // Idempotent once done — no double-processing.
+        assertTrue(reg.onRoundSettled(5, 1), "done stays done");
+        assertEq(reg.activeTimbEntries(), 0, "no double-processing");
+    }
+
+    // ─── Generation reset ─────────────────────────────────────────────────────
+
+    function test_GenerationReset_ClearsMeters() public {
+        _timbsEntry(address(0xA1), S1);
+        _ethEntry(address(0xB1), S2);
+        assertGt(reg.activeTimbEntries(), 0);
+        assertGt(reg.totalEthEscrow(), 0);
+
+        // TS-028: the FIRST start keeps generation 1 and its pre-start seats,
+        // so the meters survive it. Only a fresh generation clears them.
+        uint256 timbSeats = reg.activeTimbEntries();
+        uint256 ethEscrow = reg.totalEthEscrow();
+        reg.onGameStarted();
+        assertEq(reg.generation(), 1, "first game keeps generation 1");
+        assertEq(reg.activeTimbEntries(), timbSeats, "timb meter kept on first start");
+        assertEq(reg.totalEthEscrow(), ethEscrow, "eth meter kept on first start");
+
+        reg.onGameStarted();
+        assertEq(reg.generation(), 2, "fresh generation");
+        assertEq(reg.activeTimbEntries(), 0, "timb meter cleared");
+        assertEq(reg.totalEthEscrow(), 0, "eth meter cleared");
+        assertEq(reg.timbsPriceRefCount(), 0, "ref cleared");
+        assertEq(reg.fixedTimbsCost(), 0, "timb price cleared");
+        assertEq(reg.fixedEthCost(), 0, "eth price cleared");
+        assertEq(reg.pricedForRound(), 0, "priced-round cleared");
+    }
+
+    // ─── View consistency ─────────────────────────────────────────────────────
+
+    // nextRoundPrices() must equal what the next submit actually charges.
+    function test_NextRoundPrices_MatchesCharge() public {
+        _timbsEntry(address(0xA1), S1);
+        _timbsEntry(address(0xA2), S1);
+        _timbsEntry(address(0xA3), S1); // active 3
+        reg.setCurrentRound(1);
+
+        (, uint256 quotedTimbs) = reg.nextRoundPrices();
+
+        address w = address(0xA9);
+        _fundTimbs(w);
+        uint256 before = timbs.balanceOf(w);
+        vm.prank(w);
+        reg.submitEntry(S1, false, 0);
+        uint256 charged = before - timbs.balanceOf(w);
+
+        assertEq(charged, quotedTimbs, "quote matches the charge");
+        assertEq(reg.fixedTimbsCost(), quotedTimbs, "fixed == quote");
+    }
+}

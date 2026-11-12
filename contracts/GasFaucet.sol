@@ -1,0 +1,497 @@
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity 0.8.24;
+
+import {IERC20}        from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20}     from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Ownable}       from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step}  from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+
+/// @notice Eligibility oracle. A wallet qualifies iff its single live ticket
+///         reads `Active`. Minting that ticket cost gas + escrow, which is the
+///         Sybil gate (see dev-docs/FAUCET_SPEC.md §4).
+interface IGameRegistry {
+    // Mirror of GameRegistry.TicketStatus — order MUST match.
+    enum TicketStatus { Pending, Active, Conceded, Ineligible, Cancelled, Closed }
+    function activeTicketOf(address wallet) external view returns (uint256);
+    function effectiveStatus(uint256 ticketId) external view returns (TicketStatus);
+    function isTicketLive(uint256 ticketId) external view returns (bool);
+}
+
+/// @notice Prize pot sink — the "pot half" of each claim grows the live round.
+interface IPrize {
+    function addToPot() external payable;
+    function roundWinningString(uint256 round) external view returns (bytes6);
+}
+
+/**
+ * @title  GasFaucet
+ * @notice Atomic, reserve-backed keep-alive faucet for live players. In ONE
+ *         transaction, per eligible claim it:
+ *           1. pays `dripEth` to the claimant (their gas) and `potEth` to the
+ *              live round via `TimbPrize.addToPot()`, both from this
+ *              contract's OWN ETH reserve (it never calls TimbTreasury),
+ *           2. transfers `timbsPerClaim` TIMBS (default 1) to the claimant — the
+ *              participation-gated "fair release".
+ *
+ *         Eligibility (a live `Active` ticket) and a per-wallet cooldown are
+ *         enforced ON-CHAIN here, independent of the off-chain gatekeeper — so a
+ *         leaked dispatcher key still cannot over-drip or bypass the Sybil gate.
+ *
+ *         SAFETY CONTROLS (owner / guardian):
+ *           - `ethPaused` and `timbsPaused` are INDEPENDENT kill switches. Pause
+ *             one leg and the other still dispenses; pause both and claims revert.
+ *             The guardian may pause; only the owner may unpause (TS-054).
+ *           - `ethCap` / `timbsCap` are the MAX approved to ever distribute
+ *             (cumulative). A claim that would push `*Distributed` past its cap
+ *             skips that leg (the other leg still dispenses; TS-027). Raising
+ *             a cap "approves" more; lowering it below what's already gone
+ *             out simply stops further outflow of that asset.
+ *
+ *         FUNDING MODEL (both legs self-funded, separate from the treasury):
+ *           - ETH is PRE-FUNDED into this contract: anyone may send ETH here
+ *             (plain transfer, `EthFunded`). Each claim pays drip + pot from
+ *             this reserve; when it is short the ETH leg is skipped and the
+ *             TIMBS leg still pays (like a pause). The treasury's fee inflow,
+ *             buybacks and epoch outflows therefore can never starve claims,
+ *             and the faucet can never draw on treasury ETH. `sweepEth`
+ *             (owner) is the reserve's exit.
+ *           - TIMBS is PRE-FUNDED likewise (the owner moves the approved
+ *             budget here); `recoverTimbs` returns any unused budget.
+ *
+ *         DESIGN STUB — UNAUDITED. Custodies an ETH reserve and a TIMBS
+ *         budget. Audit before mainnet.
+ */
+contract GasFaucet is Ownable2Step, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    // ─── Immutable wiring ──────────────────────────────────────────────────────
+
+    IERC20        public immutable timbs;
+    IGameRegistry public immutable registry;
+    IPrize        public immutable prize;
+
+    // ─── Dispense parameters (owner-settable) ───────────────────────────────────
+
+    /// @notice ETH sent to the claimant per claim (their gas).
+    uint256 public dripEth;
+    /// @notice ETH sent to the live round pot per claim.
+    uint256 public potEth;
+    /// @notice TIMBS sent to the claimant per claim — the fair-release drip.
+    uint256 public timbsPerClaim;
+    /// @notice Minimum seconds between claims for a given wallet.
+    uint256 public cooldown;
+
+    // ─── Independent kill switches ──────────────────────────────────────────────
+
+    /// @notice When true, the ETH legs (drip + pot) are skipped.
+    bool public ethPaused;
+    /// @notice When true, the TIMBS leg is skipped.
+    bool public timbsPaused;
+
+    // ─── Approved-to-distribute ceilings (cumulative) ───────────────────────────
+
+    /// @notice Max total ETH (drip + pot) this faucet may ever distribute.
+    uint256 public ethCap;
+    /// @notice Max total TIMBS this faucet may ever distribute.
+    uint256 public timbsCap;
+    /// @notice ETH distributed so far (drip + pot), lifetime.
+    uint256 public ethDistributed;
+    /// @notice TIMBS distributed so far, lifetime.
+    uint256 public timbsDistributed;
+
+    /// @notice Max TIMBS any ONE wallet may take, lifetime. **0 = no per-wallet
+    ///         limit** (the original behaviour).
+    /// @dev    The cooldown paces a wallet but never stops it: over an era of E
+    ///         days a single wallet can claim E/cooldown + 1 times, so a handful
+    ///         of dedicated wallets can absorb the whole `timbsCap`. At the Era-1
+    ///         mainnet numbers (250 days, 1/day, 100 TIMBS, 500,000 cap) that is
+    ///         ~20 wallets. This bounds concentration without touching the
+    ///         cooldown or the ticket gate. See dev-docs/EMISSIONS_SCHEDULE.md §7.
+    uint256 public maxTimbsPerWallet;
+    /// @notice TIMBS dispensed to each wallet so far, lifetime.
+    mapping(address => uint256) public timbsClaimedBy;
+
+    // ─── Access ─────────────────────────────────────────────────────────────────
+
+    /// @notice May trigger `dispense` (the keeper worker). address(0) disables it;
+    ///         the owner may always dispense.
+    address public dispatcher;
+    /// @notice May flip the pause switches (alongside the owner). address(0) = none.
+    address public guardian;
+
+    /// @notice Last claim timestamp per wallet (cooldown anchor).
+    mapping(address => uint256) public lastClaimAt;
+
+    /// @notice Top-trader cooldown reset (dev-docs/BETA_ETH_ONLY.md §5): when
+    ///         the wallet's latest grant was made (informational).
+    mapping(address => uint256) public resetGrantedAt;
+
+    /// @notice A granted reset the wallet has not yet spent. It lifts the
+    ///         cooldown for exactly one claim and is cleared by the wallet's
+    ///         next claim. TS-053: a flag, not a timestamp comparison, so a
+    ///         grant in the same second as the wallet's last claim still counts.
+    mapping(address => bool) public resetPending;
+
+    /// @notice One reset per settled round.
+    mapping(uint256 => bool) public resetUsed;
+
+    // ─── Events ─────────────────────────────────────────────────────────────────
+
+    event Dispensed(address indexed claimant, uint256 ethToWallet, uint256 ethToPot, uint256 timbsOut);
+    event EthPausedSet(bool paused);
+    event TimbsPausedSet(bool paused);
+    event EthCapSet(uint256 cap);
+    event TimbsCapSet(uint256 cap);
+    event MaxTimbsPerWalletSet(uint256 cap);
+    event ParamsSet(uint256 dripEth, uint256 potEth, uint256 timbsPerClaim, uint256 cooldown);
+    event DispatcherSet(address indexed dispatcher);
+    event GuardianSet(address indexed guardian);
+    event TimbsRecovered(address indexed to, uint256 amount);
+    event EthSwept(address indexed to, uint256 amount);
+    event EthFunded(address indexed from, uint256 amount);
+    event ERC20Recovered(address indexed token, address indexed to, uint256 amount);
+    event ResetGranted(uint256 indexed round, address indexed wallet);
+
+    // ─── Errors ─────────────────────────────────────────────────────────────────
+
+    error ZeroAddress();
+    error ZeroAmount();
+    error NotDispatcher();
+    error NotPauser();
+    error UnpauseOwnerOnly();
+    error NothingToDispense();     // both legs paused
+    error NotEligible(address claimant);
+    error CooldownActive(uint256 readyAt);
+    error EthCapExceeded(uint256 requested, uint256 remaining);
+    error TimbsCapExceeded(uint256 requested, uint256 remaining);
+    error InsufficientTimbsBalance(uint256 requested, uint256 held);
+    error WalletTimbsCapExceeded(uint256 requested, uint256 remaining);
+    error EthTransferFailed();
+    error EthLegUnavailable();
+    error RoundNotSettled(uint256 round);
+    error ResetAlreadyGranted(uint256 round);
+
+    // ─── Modifiers ──────────────────────────────────────────────────────────────
+
+    modifier onlyDispatcher() {
+        if (msg.sender != dispatcher && msg.sender != owner()) revert NotDispatcher();
+        _;
+    }
+
+    modifier onlyPauser() {
+        if (msg.sender != guardian && msg.sender != owner()) revert NotPauser();
+        _;
+    }
+
+    // ─── Constructor ──────────────────────────────────────────────────────────────
+
+    /**
+     * @param _timbs         TIMBS token.
+     * @param _registry      GameRegistry (eligibility oracle).
+     * @param _prize         TimbPrize (pot sink).
+     * @param _dripEth       ETH to the claimant per claim.
+     * @param _potEth        ETH to the pot per claim.
+     * @param _timbsPerClaim TIMBS to the claimant per claim (1e18 = 1 TIMB).
+     * @param _cooldown      Seconds between claims per wallet (e.g. 24h).
+     */
+    constructor(
+        address _timbs,
+        address _registry,
+        address _prize,
+        uint256 _dripEth,
+        uint256 _potEth,
+        uint256 _timbsPerClaim,
+        uint256 _cooldown
+    ) Ownable(msg.sender) {
+        if (_timbs == address(0) || _registry == address(0) || _prize == address(0)) revert ZeroAddress();
+
+        timbs    = IERC20(_timbs);
+        registry = IGameRegistry(_registry);
+        prize    = IPrize(_prize);
+
+        dripEth       = _dripEth;
+        potEth        = _potEth;
+        timbsPerClaim = _timbsPerClaim;
+        cooldown      = _cooldown;
+
+        emit ParamsSet(_dripEth, _potEth, _timbsPerClaim, _cooldown);
+    }
+
+    // ─── Core: dispense ───────────────────────────────────────────────────────────
+
+    /**
+     * @notice Dispense one claim to `claimant` if eligible and off cooldown.
+     * @dev Checks-effects-interactions + nonReentrant. Each active leg is gated
+     *      by its own pause flag and its own cumulative cap. Cooldown is stamped
+     *      once per successful dispense regardless of which legs ran.
+     */
+    function dispense(address claimant) external nonReentrant onlyDispatcher {
+        if (claimant == address(0)) revert ZeroAddress();
+
+        bool doEth   = !ethPaused   && (dripEth + potEth) > 0;
+        bool doTimbs = !timbsPaused && timbsPerClaim > 0;
+        if (!doEth && !doTimbs) revert NothingToDispense();
+
+        // ── Eligibility (on-chain Sybil gate): a live Active ticket. ──
+        //    TS-025: the stored status outlives the game — a ticket left Active
+        //    in a retired generation, or past its last eligible round, must not
+        //    keep drawing the faucet. isTicketLive checks both.
+        uint256 ticketId = registry.activeTicketOf(claimant);
+        if (ticketId == 0 ||
+            registry.effectiveStatus(ticketId) != IGameRegistry.TicketStatus.Active ||
+            !registry.isTicketLive(ticketId)) {
+            revert NotEligible(claimant);
+        }
+
+        // ── Cooldown (a never-claimed wallet is always allowed; a reset
+        //    granted after the last claim lifts it once). ──
+        if (!_offCooldown(claimant)) revert CooldownActive(lastClaimAt[claimant] + cooldown);
+
+        uint256 ethOut = doEth ? dripEth + potEth : 0;
+        uint256 timbsOut = doTimbs ? timbsPerClaim : 0;
+
+        // ── Leg headroom: a leg that cannot pay retires itself, like a pause,
+        //    and the other leg still dispenses (TS-027 for the global caps,
+        //    TS-033 for a TIMBS balance shortfall or the per-wallet TIMBS cap).
+        //    Only when no leg is left does the call revert, naming the reason.
+        uint256 ethRemaining = ethCap > ethDistributed ? ethCap - ethDistributed : 0;
+        bool ethCapped = doEth && ethOut > ethRemaining;
+        if (ethCapped) doEth = false;
+        (uint8 timbsBlock, uint256 timbsAvail) =
+            doTimbs ? _timbsShortfall(claimant, timbsOut) : (uint8(0), uint256(0));
+        if (timbsBlock != 0) doTimbs = false;
+        if (!doEth && !doTimbs) {
+            if (ethCapped)        revert EthCapExceeded(ethOut, ethRemaining);
+            if (timbsBlock == 1)  revert TimbsCapExceeded(timbsOut, timbsAvail);
+            if (timbsBlock == 2)  revert InsufficientTimbsBalance(timbsOut, timbsAvail);
+            revert WalletTimbsCapExceeded(timbsOut, timbsAvail);
+        }
+        if (ethCapped) ethOut = 0;
+        if (!doTimbs)  timbsOut = 0;
+
+        // ── Effects (before any external call). ──
+        lastClaimAt[claimant] = block.timestamp;
+        if (resetPending[claimant]) resetPending[claimant] = false;
+        if (doTimbs) {
+            timbsDistributed          += timbsOut;
+            timbsClaimedBy[claimant]  += timbsOut;
+        }
+
+        // ── Interactions. ──
+        // TS-035: the ETH leg is best-effort against its counterparties. A
+        // reserve too low to pay the claim, or a pot deposit the prize refuses
+        // (stale pointer), must not take the independent, pre-funded TIMBS leg
+        // down with it. ETH counters apply only to what
+        // actually left; the call reverts only when no leg could pay.
+        uint256 ethToWallet;
+        uint256 ethToPot;
+        if (doEth) {
+            (ethToWallet, ethToPot) = _runEthLeg(claimant);
+            if (ethToWallet + ethToPot == 0 && !doTimbs) revert EthLegUnavailable();
+            ethDistributed += ethToWallet + ethToPot;
+        }
+        if (doTimbs) {
+            timbs.safeTransfer(claimant, timbsOut);
+        }
+
+        emit Dispensed(claimant, ethToWallet, ethToPot, timbsOut);
+    }
+
+    /// @dev Pay drip + pot from this contract's own ETH reserve. Returns what
+    ///      was actually paid out: (0, 0) if the reserve cannot cover the whole
+    ///      claim (the leg is skipped rather than paying a partial drip). A
+    ///      share that cannot be delivered (claimant without a receive path,
+    ///      prize refusing the deposit) simply stays in the reserve (TS-038):
+    ///      nothing on this leg may take the independent TIMBS leg down.
+    function _runEthLeg(address claimant) internal returns (uint256 toWallet, uint256 toPot) {
+        if (address(this).balance < dripEth + potEth) return (0, 0);
+        if (dripEth > 0) {
+            (bool ok, ) = payable(claimant).call{value: dripEth}("");
+            if (ok) toWallet = dripEth;
+        }
+        if (potEth > 0) {
+            try prize.addToPot{value: potEth}() {
+                toPot = potEth;
+            } catch { /* stays in the reserve */ }
+        }
+    }
+
+    /// @notice ETH held to pay future claims (drip + pot).
+    function ethReserve() external view returns (uint256) {
+        return address(this).balance;
+    }
+
+    /// @dev Why the TIMBS leg cannot pay `out` to `claimant`, if it cannot:
+    ///      1 = global cap, 2 = contract balance, 3 = per-wallet cap; 0 = fine.
+    ///      Second value is the headroom that was short.
+    function _timbsShortfall(address claimant, uint256 out)
+        internal
+        view
+        returns (uint8, uint256)
+    {
+        uint256 remaining = timbsCap > timbsDistributed ? timbsCap - timbsDistributed : 0;
+        if (out > remaining) return (1, remaining);
+        uint256 held = timbs.balanceOf(address(this));
+        if (out > held) return (2, held);
+        if (maxTimbsPerWallet != 0) {
+            uint256 taken = timbsClaimedBy[claimant];
+            uint256 walletRemaining = maxTimbsPerWallet > taken ? maxTimbsPerWallet - taken : 0;
+            if (out > walletRemaining) return (3, walletRemaining);
+        }
+        return (0, 0);
+    }
+
+    /// @notice True if `claimant` could claim right now (eligible, off cooldown,
+    ///         and at least one leg funded + unpaused + under cap). View helper
+    ///         for the gatekeeper / frontend; `dispense` re-checks everything.
+    function claimable(address claimant) external view returns (bool) {
+        if (claimant == address(0)) return false;
+
+        uint256 ticketId = registry.activeTicketOf(claimant);
+        if (ticketId == 0 ||
+            registry.effectiveStatus(ticketId) != IGameRegistry.TicketStatus.Active ||
+            !registry.isTicketLive(ticketId)) {
+            return false;
+        }
+        if (!_offCooldown(claimant)) return false;
+
+        bool ethOk = !ethPaused && (dripEth + potEth) > 0 &&
+            ethDistributed + dripEth + potEth <= ethCap;
+        bool timbsOk = !timbsPaused && timbsPerClaim > 0 &&
+            timbsDistributed + timbsPerClaim <= timbsCap &&
+            timbs.balanceOf(address(this)) >= timbsPerClaim &&
+            (maxTimbsPerWallet == 0 ||
+             timbsClaimedBy[claimant] + timbsPerClaim <= maxTimbsPerWallet);
+
+        return ethOk || timbsOk;
+    }
+
+    /// @dev Off cooldown: never claimed, the cooldown has elapsed, or a granted
+    ///      reset is pending. Every claim clears the pending reset, so a grant
+    ///      is spent by the wallet's next claim.
+    function _offCooldown(address claimant) internal view returns (bool) {
+        uint256 last = lastClaimAt[claimant];
+        return last == 0
+            || block.timestamp >= last + cooldown
+            || resetPending[claimant];
+    }
+
+    // ─── Dispatcher: top-trader reset ───────────────────────────────────────────
+
+    /// @notice Grant `wallet` one cooldown reset for settled `round`: the
+    ///         keeper's pick of the round's top ETH-volume Active ticket holder
+    ///         (tally is off-chain from router SwapExecuted events, so anyone
+    ///         can re-derive it). One grant per round; eligibility (an Active
+    ///         ticket) is still checked at claim time.
+    function grantReset(uint256 round, address wallet) external onlyDispatcher {
+        if (wallet == address(0)) revert ZeroAddress();
+        if (prize.roundWinningString(round) == bytes6(0)) revert RoundNotSettled(round);
+        if (resetUsed[round]) revert ResetAlreadyGranted(round);
+        resetUsed[round] = true;
+        resetGrantedAt[wallet] = block.timestamp;
+        resetPending[wallet] = true;
+        emit ResetGranted(round, wallet);
+    }
+
+    // ─── Owner / guardian: pauses ───────────────────────────────────────────────
+
+    /// @notice TS-054: the guardian may pause a leg; only the owner (the
+    ///         timelock) may unpause, so a leaked guardian key cannot undo a stop.
+    function setEthPaused(bool paused) external onlyPauser {
+        if (!paused && msg.sender != owner()) revert UnpauseOwnerOnly(); // TS-054
+        ethPaused = paused;
+        emit EthPausedSet(paused);
+    }
+
+    function setTimbsPaused(bool paused) external onlyPauser {
+        if (!paused && msg.sender != owner()) revert UnpauseOwnerOnly(); // TS-054
+        timbsPaused = paused;
+        emit TimbsPausedSet(paused);
+    }
+
+    // ─── Owner: approved-to-distribute ceilings ─────────────────────────────────
+
+    /// @notice Set the max total ETH this faucet may ever distribute. Raising it
+    ///         approves more; it cannot be read as retroactively clawing back
+    ///         what already went out.
+    function setEthCap(uint256 cap) external onlyOwner {
+        ethCap = cap;
+        emit EthCapSet(cap);
+    }
+
+    /// @notice Set the max total TIMBS this faucet may ever distribute.
+    function setTimbsCap(uint256 cap) external onlyOwner {
+        timbsCap = cap;
+        emit TimbsCapSet(cap);
+    }
+
+    // ─── Owner: parameters ──────────────────────────────────────────────────────
+
+    function setParams(uint256 _dripEth, uint256 _potEth, uint256 _timbsPerClaim, uint256 _cooldown)
+        external
+        onlyOwner
+    {
+        dripEth       = _dripEth;
+        potEth        = _potEth;
+        timbsPerClaim = _timbsPerClaim;
+        cooldown      = _cooldown;
+        emit ParamsSet(_dripEth, _potEth, _timbsPerClaim, _cooldown);
+    }
+
+    // ─── Owner: access wiring ───────────────────────────────────────────────────
+
+    /// @notice Set the per-wallet lifetime TIMBS ceiling. 0 disables it.
+    /// @dev    Raising or lowering it is one tx; lowering it below what a wallet
+    ///         has already taken simply leaves that wallet with no headroom, it
+    ///         never claws anything back.
+    function setMaxTimbsPerWallet(uint256 cap) external onlyOwner {
+        maxTimbsPerWallet = cap;
+        emit MaxTimbsPerWalletSet(cap);
+    }
+
+    function setDispatcher(address _dispatcher) external onlyOwner {
+        dispatcher = _dispatcher;
+        emit DispatcherSet(_dispatcher);
+    }
+
+    function setGuardian(address _guardian) external onlyOwner {
+        guardian = _guardian;
+        emit GuardianSet(_guardian);
+    }
+
+    // ─── Owner: recovery ────────────────────────────────────────────────────────
+
+    /// @notice Return unused TIMBS budget (e.g. back to the treasury). The
+    ///         approved budget is custodied here; this is its exit.
+    function recoverTimbs(address to, uint256 amount) external onlyOwner {
+        if (to == address(0)) revert ZeroAddress();
+        timbs.safeTransfer(to, amount);
+        emit TimbsRecovered(to, amount);
+    }
+
+    /// @notice Withdraw ETH from the claim reserve (retiring the faucet, or
+    ///         moving surplus). This is the reserve's only exit besides claims.
+    function sweepEth(address to, uint256 amount) external onlyOwner {
+        if (to == address(0)) revert ZeroAddress();
+        (bool ok, ) = payable(to).call{value: amount}("");
+        if (!ok) revert EthTransferFailed();
+        emit EthSwept(to, amount);
+    }
+
+
+    /// @notice Sweep a stray ERC-20 (for example WETH sent instead of ETH).
+    ///         The faucet custodies only its TIMBS budget (recoverTimbs covers
+    ///         that); any other ERC-20 here is a mistake. ERC-20 only: ETH keeps its own, bounded exit.
+    function recoverERC20(address token, address to, uint256 amount) external onlyOwner nonReentrant {
+        if (token == address(0) || to == address(0)) revert ZeroAddress();
+        if (amount == 0) revert ZeroAmount();
+        SafeERC20.safeTransfer(IERC20(token), to, amount);
+        emit ERC20Recovered(token, to, amount);
+    }
+
+    /// @notice Fund the claim reserve: a plain ETH transfer from anyone.
+    receive() external payable {
+        emit EthFunded(msg.sender, msg.value);
+    }
+}

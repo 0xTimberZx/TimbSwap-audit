@@ -1,0 +1,338 @@
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity 0.8.24;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
+/**
+ * @title TimbYieldVault
+ * @notice Internal, treasury-funded yield engine for the prize game
+ *         (PoolTogether-inspired, fully self-contained on Arbitrum Sepolia).
+ *
+ * Model:
+ *   - Active tickets' escrow is counted here as WEIGHT ONLY — the principal
+ *     itself never leaves GameRegistry's ring-fence and can never be lost
+ *     through this contract.
+ *   - While weight is registered, yield accrues per-second, proportional to
+ *     total weight, and is CAPPED by this contract's funded reserve. If the
+ *     reserve runs dry, accrual simply pauses — principal is never touched.
+ *   - Accrued yield goes to ONE destination: the prize pot. Depositors get
+ *     their principal back plus a chance at the pot — never the yield
+ *     directly. That's what keeps it a lottery, not a savings account.
+ *   - Funded by the Treasury / owner from protocol fee revenue (fund() or a
+ *     plain ETH send). Rate is governance-set.
+ *
+ * Weight denomination:
+ *   GameRegistry registers a FLAT weight per activated ticket
+ *   (GameRegistry.VAULT_WEIGHT_UNIT = 1e14 wei = 0.0001 ETH, as address(0)),
+ *   whatever the ticket paid and in whichever token. So every ticket earns the
+ *   same share and the rate below applies to that unit, NOT to the escrow:
+ *   at a 0.001 ETH ticket, 10_000 bps on the weight is 10% a year on the
+ *   deposit, and 1_000 bps would be 1%. The timbsWeight1e18 conversion is kept
+ *   for callers that register a token amount directly; registry tickets never
+ *   reach it.
+ *
+ * Harvest:
+ *   TimbPrize pulls all accrued yield at each round settlement, adds it to
+ *   currentAccumulatedRewards, and forwards the ETH into PrizeEscrow — the
+ *   4th pot source alongside swap fees, seeding, and the snowball remainder.
+ *
+ * Security:
+ *   - register/remove only from GameRegistry; harvest only from TimbPrize.
+ *   - Failed harvest transfer restores state and returns 0 — settlement can
+ *     never brick on this contract.
+ *   - No user funds held here, ever: emergencyWithdraw only moves the
+ *     protocol's own subsidy reserve.
+ *
+ * Deployment:
+ *   1. Deploy TimbYieldVault()
+ *   2. setGameRegistry(registry); setTimbPrize(prize)
+ *   3. (leave timbsWeight1e18 at 0; registry tickets register ETH weight)
+ *   4. setYieldAPRBps(10_000)            // 100% on the 0.0001 ETH unit
+ *                                        // = 10% a year on a 0.001 ETH ticket
+ *   5. fund() with ETH from the Treasury
+ */
+contract TimbYieldVault is Ownable2Step, ReentrancyGuard {
+
+    // ─── State ───────────────────────────────────────────────────────────────
+
+    /// @notice GameRegistry — only caller for register()/remove().
+    address public gameRegistry;
+
+    /// @notice TimbPrize — only caller for harvest().
+    address public timbPrize;
+
+    /// @notice Sum of registered ticket weight (ETH-denominated wei) for the
+    ///         current epoch only.
+    uint256 public totalWeight;
+
+    /// @notice Weight epoch (TS-014). Bumped on every game generation and on
+    ///         every registry change, so weight registered under a retired
+    ///         game or a retired registry stops accruing in O(1) and a fresh
+    ///         registry's ticket #N can never alias an old registry's #N.
+    uint256 public epoch;
+
+    /// @dev epoch → ticket id → registered weight.
+    mapping(uint256 => mapping(uint256 => uint256)) private _weightOf;
+
+    /// @notice Registered weight of a ticket in the current epoch.
+    function weightOf(uint256 ticketId) external view returns (uint256) {
+        return _weightOf[epoch][ticketId];
+    }
+
+    /// @notice Pot wei generated per 1e18 weight per second.
+    uint256 public ratePerSecond1e18;
+
+    /// @notice Weight wei per TIMBS wei, 1e18-scaled
+    ///         (weight = timbsAmount * timbsWeight1e18 / 1e18).
+    uint256 public timbsWeight1e18;
+
+    /// @notice Yield accrued and earmarked for the pot, awaiting harvest.
+    uint256 public accruedForPot;
+
+    /// @notice Last accrual timestamp.
+    uint256 public lastAccrual;
+
+    // ─── Events ──────────────────────────────────────────────────────────────
+
+    event WeightRegistered(uint256 indexed ticketId, uint256 weight, uint256 totalWeight);
+    event WeightRemoved(uint256 indexed ticketId, uint256 weight, uint256 totalWeight);
+    event YieldAccrued(uint256 amount, uint256 accruedForPot);
+    event Harvested(uint256 amount, address indexed to);
+    event Funded(address indexed from, uint256 amount);
+    event RateSet(uint256 ratePerSecond1e18);
+    event TimbsWeightSet(uint256 timbsWeight1e18);
+    event GameRegistrySet(address indexed registry);
+    event EpochStarted(uint256 indexed epoch, uint256 retiredWeight);
+    event TimbPrizeSet(address indexed prize);
+    event EmergencyWithdrawn(address indexed to, uint256 amount);
+    event ERC20Recovered(address indexed token, address indexed to, uint256 amount);
+
+    // ─── Errors ──────────────────────────────────────────────────────────────
+
+    error ZeroAddress();
+    error ZeroAmount();
+    error NotGameRegistry();
+    error NotTimbPrize();
+    error InsufficientReserve(uint256 requested, uint256 available);
+
+    // ─── Modifiers ───────────────────────────────────────────────────────────
+
+    modifier onlyGameRegistry() {
+        if (msg.sender != gameRegistry) revert NotGameRegistry();
+        _;
+    }
+
+    modifier onlyTimbPrize() {
+        if (msg.sender != timbPrize) revert NotTimbPrize();
+        _;
+    }
+
+    // ─── Constructor ─────────────────────────────────────────────────────────
+
+    constructor() Ownable(msg.sender) {
+        lastAccrual = block.timestamp;
+    }
+
+    // ─── Accrual ─────────────────────────────────────────────────────────────
+
+    /// @notice ETH available to back future accrual (not yet earmarked).
+    function reserve() public view returns (uint256) {
+        return address(this).balance - accruedForPot;
+    }
+
+    /// @dev Accrue since last touch: totalWeight × rate × elapsed, capped by
+    ///      the funded reserve. Reserve dry ⇒ accrual pauses; principal is
+    ///      never involved (it isn't even held here).
+    function _accrue() internal {
+        uint256 elapsed = block.timestamp - lastAccrual;
+        if (elapsed == 0) return;
+        lastAccrual = block.timestamp;
+
+        if (totalWeight == 0 || ratePerSecond1e18 == 0) return;
+
+        uint256 pending = (totalWeight * ratePerSecond1e18 / 1e18) * elapsed;
+        uint256 available = address(this).balance - accruedForPot;
+        if (pending > available) pending = available;
+        if (pending == 0) return;
+
+        accruedForPot += pending;
+        emit YieldAccrued(pending, accruedForPot);
+    }
+
+    /// @notice Accrued-so-far including live (unstored) accrual — for UI.
+    function previewAccrued() external view returns (uint256) {
+        uint256 pending = 0;
+        if (totalWeight > 0 && ratePerSecond1e18 > 0) {
+            pending = (totalWeight * ratePerSecond1e18 / 1e18)
+                * (block.timestamp - lastAccrual);
+            uint256 available = address(this).balance - accruedForPot;
+            if (pending > available) pending = available;
+        }
+        return accruedForPot + pending;
+    }
+
+    // ─── GameRegistry: Weight ────────────────────────────────────────────────
+
+    /**
+     * @notice Register an activated ticket's escrow weight. Idempotent per id.
+     * @param ticketId Ticket id (from GameRegistry).
+     * @param token    Escrow token — address(0) = ETH.
+     * @param amount   Escrow amount (wei of its token).
+     */
+    function register(uint256 ticketId, address token, uint256 amount)
+        external
+        onlyGameRegistry
+    {
+        if (_weightOf[epoch][ticketId] != 0) return; // already registered
+        _accrue();
+
+        uint256 w = token == address(0)
+            ? amount
+            : amount * timbsWeight1e18 / 1e18;
+        if (w == 0) return;
+
+        _weightOf[epoch][ticketId] = w;
+        totalWeight += w;
+        emit WeightRegistered(ticketId, w, totalWeight);
+    }
+
+    /// @notice Remove a ticket's weight (exited Active). Idempotent.
+    function remove(uint256 ticketId) external onlyGameRegistry {
+        uint256 w = _weightOf[epoch][ticketId];
+        if (w == 0) return;
+        _accrue();
+
+        delete _weightOf[epoch][ticketId];
+        totalWeight -= w;
+        emit WeightRemoved(ticketId, w, totalWeight);
+    }
+
+    /// @notice Start a fresh weight epoch (TS-014): accrues up to now, then
+    ///         retires every registered weight in O(1). Called by the registry
+    ///         when a new game generation starts, and by setGameRegistry when
+    ///         the registry changes. Owner may also call it directly.
+    function newEpoch() external {
+        if (msg.sender != gameRegistry && msg.sender != owner()) revert NotGameRegistry();
+        _newEpoch();
+    }
+
+    function _newEpoch() internal {
+        _accrue();
+        uint256 retired = totalWeight;
+        totalWeight = 0;
+        epoch += 1;
+        emit EpochStarted(epoch, retired);
+    }
+
+    // ─── TimbPrize: Harvest ──────────────────────────────────────────────────
+
+    /**
+     * @notice Pull all accrued yield to TimbPrize (round settlement).
+     * @dev On transfer failure, state is restored and 0 returned — the
+     *      settlement transaction never bricks on this contract.
+     * @return amount ETH wei sent to TimbPrize for the pot.
+     */
+    function harvest() external nonReentrant onlyTimbPrize returns (uint256 amount) {
+        _accrue();
+        amount = accruedForPot;
+        if (amount == 0) return 0;
+
+        accruedForPot = 0;
+        (bool ok,) = payable(timbPrize).call{value: amount}("");
+        if (!ok) {
+            accruedForPot = amount;
+            return 0;
+        }
+        emit Harvested(amount, timbPrize);
+    }
+
+    // ─── Funding ─────────────────────────────────────────────────────────────
+
+    /// @notice Top up the yield reserve (Treasury / owner / anyone).
+    function fund() external payable {
+        if (msg.value == 0) revert ZeroAmount();
+        emit Funded(msg.sender, msg.value);
+    }
+
+    receive() external payable {
+        if (msg.value > 0) emit Funded(msg.sender, msg.value);
+    }
+
+    // ─── Owner: Config ───────────────────────────────────────────────────────
+
+    /// @dev Repointing the registry retires the old registry's weight
+    ///      (TS-014): its tickets can no longer be removed through it, and a
+    ///      fresh registry restarts ticket ids from 1.
+    function setGameRegistry(address _registry) external onlyOwner {
+        if (_registry == address(0)) revert ZeroAddress();
+        if (gameRegistry != address(0) && _registry != gameRegistry) _newEpoch();
+        gameRegistry = _registry;
+        emit GameRegistrySet(_registry);
+    }
+
+    function setTimbPrize(address _prize) external onlyOwner {
+        if (_prize == address(0)) revert ZeroAddress();
+        timbPrize = _prize;
+        emit TimbPrizeSet(_prize);
+    }
+
+    /// @notice Raw rate: pot wei per 1e18 weight per second.
+    function setRatePerSecond(uint256 _rate1e18) external onlyOwner {
+        _accrue(); // settle at the old rate first
+        ratePerSecond1e18 = _rate1e18;
+        emit RateSet(_rate1e18);
+    }
+
+    /// @notice Convenience: set the rate as an APR in basis points on the
+    ///         REGISTERED WEIGHT, which is a flat 0.0001 ETH per ticket (see the
+    ///         header): 10_000 = the weight earns 100% a year, which is 10% a
+    ///         year on a 0.001 ETH ticket; 1_000 would be 1%.
+    function setYieldAPRBps(uint256 aprBps) external onlyOwner {
+        _accrue();
+        ratePerSecond1e18 = aprBps * 1e18 / 10_000 / 365 days;
+        emit RateSet(ratePerSecond1e18);
+    }
+
+    /// @notice ETH-weight per TIMBS (1e18-scaled) for token-denominated
+    ///         register() calls. Historical: 1e11 made 1000 TIMBS ≙ 0.0001 ETH
+    ///         under the old fixed entry price. GameRegistry now registers a
+    ///         flat ETH weight for every ticket, so this is unused by the game
+    ///         and should stay 0.
+    function setTimbsWeight1e18(uint256 _w) external onlyOwner {
+        _accrue();
+        timbsWeight1e18 = _w;
+        emit TimbsWeightSet(_w);
+    }
+
+    /// @notice Withdraw un-earmarked reserve — protocol subsidy money only;
+    ///         no user principal is ever held in this contract.
+    function emergencyWithdraw(address to, uint256 amount)
+        external
+        nonReentrant
+        onlyOwner
+    {
+        if (to == address(0)) revert ZeroAddress();
+        if (amount == 0)      revert ZeroAmount();
+        uint256 available = address(this).balance - accruedForPot;
+        if (amount > available) revert InsufficientReserve(amount, available);
+        (bool ok,) = payable(to).call{value: amount}("");
+        if (!ok) revert ZeroAmount();
+        emit EmergencyWithdrawn(to, amount);
+    }
+
+    /// @notice Sweep a stray ERC-20 (for example WETH sent instead of ETH).
+    ///         The vault custodies native ETH only, never a token, so any
+    ///         ERC-20 balance here is a mistake and belongs to nobody but the
+    ///         protocol. Deliberately has no ETH branch: ETH leaves only via
+    ///         emergencyWithdraw, which is bounded by the un-earmarked reserve.
+    function recoverERC20(address token, address to, uint256 amount) external onlyOwner nonReentrant {
+        if (token == address(0) || to == address(0)) revert ZeroAddress();
+        if (amount == 0) revert ZeroAmount();
+        SafeERC20.safeTransfer(IERC20(token), to, amount);
+        emit ERC20Recovered(token, to, amount);
+    }
+}

@@ -1,0 +1,989 @@
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity 0.8.24;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/access/Ownable2Step.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+
+// ─── Interfaces ──────────────────────────────────────────────────────────
+
+using SafeERC20 for IERC20;
+
+    interface ITimbsToken is IERC20 {
+    function burn(uint256 amount) external;
+}
+
+    interface IWETH {
+        function deposit() external payable;
+        function withdraw(uint256 amount) external;
+    }
+
+    interface ITimbStaking {
+        function notifyRewardAmount(uint256 amount, uint256 duration) external;
+    }
+
+    interface ITimbSwapPair {
+        function getReserves() external view returns (uint112, uint112, uint32);
+        function swap(uint256 amount0Out, uint256 amount1Out, address to) external;
+        function token0() external view returns (address);
+        function token1() external view returns (address);
+        function burn(address to) external returns (uint256 amount0, uint256 amount1);
+        function price0CumulativeLast() external view returns (uint256);
+        function price1CumulativeLast() external view returns (uint256);
+    }
+
+    interface IPrizeEscrow {
+        function deposit() external payable;
+        function timbPrize() external view returns (address);
+    }
+
+    interface ITimbPrizePot {
+        function addToPot() external payable;
+        function prizeEscrow() external view returns (address);
+    }
+
+    interface ITimbSwapFactoryView {
+        function getPair(address tokenA, address tokenB) external view returns (address);
+    }
+
+    interface ITimbSwapRouter {
+        function factory() external view returns (address);
+        function addLiquidity(
+            address tokenA,
+            address tokenB,
+            uint256 amountADesired,
+            uint256 amountBDesired,
+            uint256 amountAMin,
+            uint256 amountBMin,
+            address to,
+            uint256 deadline
+        ) external returns (uint256 amountA, uint256 amountB, uint256 liquidity);
+
+        function addLiquidityETH(
+            address token,
+            uint256 amountTokenDesired,
+            uint256 amountTokenMin,
+            uint256 amountETHMin,
+            address to,
+            uint256 deadline
+        ) external payable returns (uint256 amountToken, uint256 amountETH, uint256 liquidity);
+    }
+
+/**
+ * @title TimbTreasury
+ * @notice Protocol fee routing, buyback execution, and revenue distribution.
+ *
+ * Revenue inflows:
+ *   - 0.05% protocol swap fee (from TimbSwapRouter)
+ *   - Round settlement cut from TimbPrize (owner-set %)
+ *   - Expired unclaimed winnings dividend (owner-toggle)
+ *   - Direct owner deposits (operations, grants)
+ *
+ * Revenue outflows:
+ *   - Buyback: uses ETH to purchase TIMBS from TIMBS/ETH pair, split 3 ways
+ *       └── buybackBurnRatio%    of purchased TIMBS → burned
+ *       └── buybackReserveRatio% → kept as standing reserve (stacks, never
+ *                                  auto-distributed)
+ *       └── remainder            → waterfall slice: stays in the treasury but
+ *                                  emitted as timbsToWaterfall so the epoch
+ *                                  keeper distributes it to farm / staking /
+ *                                  boost. A buyback moves out only the burn.
+ *   - Prize pot top-up → PrizeEscrow
+ *   - Staking reward top-up → TimbStaking.notifyRewardAmount()
+ *   - Protocol-owned liquidity → Router.addLiquidity[ETH] (LP held here)
+ *   - Operations → owner wallet (manual)
+ *
+ * Security:
+ *   - ReentrancyGuard on executeBuyback(), distributeToPot(), distributeToStaking().
+ *   - Buyback slippage protection: minTimbsOut parameter.
+ *   - Only owner executes buybacks and distributions.
+ *   - TIMBS burn via TIMBSToken.burn() — irreversible.
+ *   - SafeERC20 on all token operations.
+ *   - ETH never held beyond operational needs — distributed promptly.
+ *
+ * Deployment:
+ *   1. Deploy TimbTreasury(timbsToken, timbStaking, prizeEscrow, pair)
+ *   2. router.setTreasury(address(this))
+ *   3. timbStaking.setTreasury(address(this))
+ *   4. prizeEscrow owner deposits routed here
+ *   5. Verify on Sourcify
+ */
+contract TimbTreasury is Ownable2Step, ReentrancyGuard {
+
+    // ─── State ───────────────────────────────────────────────────────────────
+
+    /// @notice TIMBS token — purchased in buybacks, burned or distributed.
+    ITimbsToken public immutable timbsToken;
+
+    /// @notice TimbStaking — receives TIMBS distribution share of buyback.
+    address public timbStaking;
+
+    /// @notice PrizeEscrow — receives ETH pot top-ups.
+    address public prizeEscrow;
+
+    /// @notice TIMBS/ETH AMM pair — used for buyback execution.
+    address public timbsEthPair;
+
+    /// @notice TimbSwapRouter — used to deploy treasury-held tokens as
+    ///         protocol-owned liquidity. LP tokens are minted back to the
+    ///         treasury (`to = address(this)`). Re-wireable via `setRouter`.
+    address public router;
+
+    /// @notice WETH — the pair holds WETH, not native ETH. Buyback ETH is
+    ///         wrapped here before being paid into the pair.
+    address public weth;
+
+    /// @notice % of purchased TIMBS burned on each buyback (0–100).
+    ///         Deflationary sink. `burn + reserve` must stay ≤ 100; the
+    ///         remainder is the waterfall slice (see `buybackReserveRatio`).
+    uint256 public buybackBurnRatio;
+
+    /// @notice % of purchased TIMBS kept back in the treasury as a standing
+    ///         reserve on each buyback (0–100). Never auto-distributed — it
+    ///         stacks sweep over sweep as a solvency buffer. `burn + reserve`
+    ///         must stay ≤ 100.
+    ///
+    ///         The rest — `100 − burn − reserve` — is the **waterfall slice**:
+    ///         it also stays in the treasury's TIMBS balance, but is emitted as
+    ///         `timbsToWaterfall` so the epoch keeper can measure it as the
+    ///         per-epoch budget (`z`) it distributes to farm / staking / boost.
+    ///         Staking is funded through that waterfall, NOT a direct transfer
+    ///         here — a buyback moves no TIMBS out except the burn.
+    uint256 public buybackReserveRatio;
+
+    /// @notice Default staking distribution period when topping up staking
+    ///         via the manual `distributeToStaking` path.
+    uint256 public stakingDistributionPeriod;
+
+    /// @notice Senders whose ETH counts as protocol revenue in
+    ///         totalFeesReceived: receiveFees() callers and receive() senders
+    ///         (PrizeEscrow's round cut). Anyone else's ETH is still accepted but
+    ///         only logged as a deposit, so the fee metric can't be inflated.
+    mapping(address => bool) public authorisedFeeSenders;
+
+    /// @notice Total ETH received as protocol fees (lifetime).
+    uint256 public totalFeesReceived;
+
+    /// @notice Total TIMBS burned via buybacks (lifetime).
+    uint256 public totalTimbsBurned;
+
+    /// @notice Total TIMBS distributed to stakers via the manual
+    ///         `distributeToStaking` path (lifetime).
+    uint256 public totalTimbsDistributed;
+
+    /// @notice Total TIMBS routed to the epoch waterfall via buybacks
+    ///         (lifetime) — the retained slice the keeper measures as `z`.
+    uint256 public totalTimbsToWaterfall;
+
+    /// @notice Total TIMBS held back as standing reserve via buybacks
+    ///         (lifetime). Stays in the treasury balance; stacks over time.
+    uint256 public totalTimbsReserved;
+
+    /// @notice Total ETH sent to prize pot (lifetime).
+    uint256 public totalPotFunded;
+
+    /// @notice LP tokens per pair that the treasury added itself as protocol-
+    ///         owned liquidity. splitLpFees only redeems the balance above this,
+    ///         i.e. the LP minted to the treasury as the pools' 0.05% protocol
+    ///         share (factory feeTo). Owner can correct it with setPolLp.
+    mapping(address => uint256) public polLp;
+
+    /// @notice Total WETH-side ETH sent to the pot by splitLpFees.
+    uint256 public totalLpFeesToPot;
+
+    // ─── Operator role (M1) ────────────────────────────────────────────────────
+    // The owner is meant to be a timelock+multisig (see dev-docs/GOVERNANCE_
+    // HARDENING.md), so routine, small operational ETH spend would otherwise wait
+    // out the full timelock delay. A separate `operator` may withdraw ETH up to a
+    // rolling per-period cap — least privilege for day-to-day ops. Everything
+    // dangerous (uncapped withdrawals, ERC20 sweeps, retargeting outflow
+    // addresses) stays with the timelock owner. The cap defaults to 0, so the
+    // operator can do nothing until the owner explicitly funds the allowance.
+
+    /// @notice Rate-limited operational spender (address(0) = disabled).
+    address public operator;
+    /// @notice Max ETH the operator may withdraw per rolling window.
+    uint256 public operatorEthCap;
+    /// @notice Length of the operator's rolling spend window.
+    uint256 public operatorPeriod = 1 days;
+    /// @notice Start of the current window (lazily rolled forward).
+    uint256 public operatorWindowStart;
+    /// @notice ETH the operator has withdrawn in the current window.
+    uint256 public operatorSpentInWindow;
+
+    // ─── Buyback TWAP guard (M7) ─────────────────────────────────────────────
+    /// @notice Denominator for buyback deviation basis points.
+    uint256 private constant TWAP_BPS = 10_000;
+    /// @notice Minimum age of the stored TWAP observation before a buyback may
+    ///         use it — long enough that the average can't be moved in one block
+    ///         (or a handful), defeating a sandwich.
+    uint256 public constant MIN_TWAP_PERIOD = 30 minutes;
+    /// @notice Last TIMBS-per-ETH price accumulator (UQ112x112) snapshotted by
+    ///         updateTwap, and the timestamp it was taken at.
+    uint256 public twapTimbsPerEthCumulativeLast;
+    uint32  public twapTimestampLast;
+    /// @notice The observation before the latest one (TS-016). An unprivileged
+    ///         refresh may only rotate the pair once the latest observation is
+    ///         already MIN_TWAP_PERIOD old, so this slot is always seasoned
+    ///         once it is populated and a fresh refresh can never deny
+    ///         executeBuyback its 30-minute-old observation.
+    uint256 public twapTimbsPerEthCumulativePrev;
+    uint32  public twapTimestampPrev;
+    /// @notice Max downward deviation of the buyback fill from the TWAP the
+    ///         buyback will accept, in bps. Default 3%. Owner/timelock-set.
+    uint256 public buybackMaxDeviationBps = 300;
+    /// @notice Max ETH a single buyback may spend (0 = unlimited). Bounds the
+    ///         size (and thus price impact) of any one buyback.
+    uint256 public buybackMaxEth;
+
+    // ─── Events ──────────────────────────────────────────────────────────────
+
+    event FeesReceived(address indexed from, uint256 amount);
+    /// @notice ETH from a sender that is not an authorised fee sender.
+    event EthDeposited(address indexed from, uint256 amount);
+    event BuybackExecuted(
+        uint256 ethSpent,
+        uint256 timbsBought,
+        uint256 timbsBurned,
+        uint256 timbsToWaterfall,
+        uint256 timbsReserved
+    );
+    event PotFunded(uint256 amount);
+    event LpFeesSplit(address indexed pair, uint256 lpRedeemed, uint256 ethToPot, address indexed keptToken, uint256 keptAmount);
+    event PolLpSet(address indexed pair, uint256 amount);
+    event RouterSet(address indexed router);
+    event LiquidityProvided(
+        address indexed tokenA,
+        address indexed tokenB,
+        uint256 amountA,
+        uint256 amountB,
+        uint256 liquidity
+    );
+    event StakingFunded(uint256 timbsAmount, uint256 duration);
+    event BuybackBurnRatioSet(uint256 ratio);
+    event BuybackReserveRatioSet(uint256 ratio);
+    event TwapUpdated(uint256 timbsPerEthCumulative, uint32 timestamp);
+    event BuybackMaxDeviationSet(uint256 bps);
+    event BuybackMaxEthSet(uint256 maxEth);
+    event StakingSet(address indexed staking);
+    event PrizeEscrowSet(address indexed escrow);
+    event PairSet(address indexed pair);
+    event FeeSenderSet(address indexed sender, bool authorised);
+    event OperationalWithdraw(address indexed to, uint256 amount);
+    event OperatorSet(address indexed operator);
+    event OperatorEthCapSet(uint256 cap, uint256 period);
+
+    // ─── Errors ──────────────────────────────────────────────────────────────
+
+    error ZeroAddress();
+    error ZeroAmount();
+    error InvalidRatio(uint256 ratio);
+    error SlippageExceeded(uint256 received, uint256 minimum);
+    error BuybackFailed();
+    error InsufficientETH(uint256 requested, uint256 available);
+    error NotAuthorised();
+    error TransferFailed();
+    error OperatorCapExceeded(uint256 requested, uint256 remaining);
+    error TwapNotReady(uint256 elapsed, uint256 required);
+    error TwapTooSoon(uint256 elapsed, uint256 required);
+    error BuybackTooLarge(uint256 requested, uint256 max);
+    error EscrowMismatch(address timbPrize);
+    error NotWethPair(address pair);
+    error NotFactoryPair(address pair);
+    error NoFeeLp(address pair);
+
+    // ─── Modifiers ─────────────────────────────────────────────────────────────
+
+    /// @dev The timelock owner, or the rate-limited operator (M1).
+    modifier onlyOwnerOrOperator() {
+        if (msg.sender != owner() && msg.sender != operator) revert NotAuthorised();
+        _;
+    }
+
+    // ─── Constructor ─────────────────────────────────────────────────────────
+
+    /**
+     * @param _timbsToken   TIMBS token address.
+     * @param _timbStaking  TimbStaking contract address.
+     * @param _prizeEscrow  PrizeEscrow contract address.
+     * @param _timbsEthPair TIMBS/ETH pair address (set after pair deploy).
+     * @param _weth         WETH address (pair reserves are WETH-denominated).
+     */
+    constructor(
+        address _timbsToken,
+        address _timbStaking,
+        address _prizeEscrow,
+        address _timbsEthPair,
+        address _weth
+    ) Ownable(msg.sender) {
+        if (_timbsToken == address(0)) revert ZeroAddress();
+
+        timbsToken              = ITimbsToken(_timbsToken);
+        timbStaking             = _timbStaking;
+        prizeEscrow             = _prizeEscrow;
+        timbsEthPair            = _timbsEthPair;
+        weth                    = _weth;
+        buybackBurnRatio        = 5;  // 5% burned
+        buybackReserveRatio     = 20; // 20% held as reserve; 75% → waterfall
+        stakingDistributionPeriod = 30 days;
+
+        authorisedFeeSenders[msg.sender] = true;
+        // The round cut arrives from PrizeEscrow via receive().
+        if (_prizeEscrow != address(0)) authorisedFeeSenders[_prizeEscrow] = true;
+    }
+
+    // ─── Fee Reception ────────────────────────────────────────────────────────
+
+    /**
+     * @notice Receive protocol fees from an authorised fee sender.
+     */
+    function receiveFees() external payable {
+        if (!authorisedFeeSenders[msg.sender]) revert NotAuthorised();
+        if (msg.value == 0) revert ZeroAmount();
+        totalFeesReceived += msg.value;
+        emit FeesReceived(msg.sender, msg.value);
+    }
+
+    // ─── Buyback Execution ────────────────────────────────────────────────────
+
+    // ─── Buyback TWAP oracle (M7) ────────────────────────────────────────────
+
+    /**
+     * @dev Current TIMBS-per-ETH price accumulator (UQ112x112), computed the
+     *      Uniswap-V2 way: the pair's stored cumulative plus the in-progress
+     *      period since its last _update, so it's fresh even between swaps.
+     *      Returns the accumulator + the (uint32-wrapped) block timestamp.
+     */
+    function _timbsPerEthCumulative()
+        internal
+        view
+        returns (uint256 cumulative, uint32 blockTimestamp)
+    {
+        ITimbSwapPair pair = ITimbSwapPair(timbsEthPair);
+        bool timbsIsToken0 = pair.token0() == address(timbsToken);
+        // TIMBS-per-ETH is token0-per-token1 when TIMBS is token0 (price1), else
+        // token1-per-token0 (price0).
+        cumulative = timbsIsToken0 ? pair.price1CumulativeLast()
+                                   : pair.price0CumulativeLast();
+
+        blockTimestamp = uint32(block.timestamp % 2**32);
+        (uint112 r0, uint112 r1, uint32 tsLast) = pair.getReserves();
+        if (tsLast != blockTimestamp && r0 != 0 && r1 != 0) {
+            uint32 timeElapsed;
+            unchecked { timeElapsed = blockTimestamp - tsLast; }
+            // Mirror TimbSwapPair._update's UQ112x112 accumulation for the
+            // in-progress period. Cumulatives are designed to overflow-wrap.
+            unchecked {
+                uint256 spot = timbsIsToken0
+                    ? uint256((uint224(r0) << 112) / r1)  // TIMBS(token0) per ETH(token1)
+                    : uint256((uint224(r1) << 112) / r0); // TIMBS(token1) per ETH(token0)
+                cumulative += spot * timeElapsed;
+            }
+        }
+    }
+
+    /**
+     * @notice Snapshot the TIMBS-per-ETH TWAP accumulator. Permissionless — it
+     *         only reads public pair state — so a keeper can refresh it on a
+     *         schedule. executeBuyback requires a snapshot at least
+     *         MIN_TWAP_PERIOD old, so the average it prices against cannot be
+     *         moved within a block (or a few) to enable a sandwich.
+     * @dev    TS-016: an unprivileged caller may only rotate the observation
+     *         once the latest one is MIN_TWAP_PERIOD old, and the previous
+     *         observation is kept. A griefer refreshing every block therefore
+     *         cannot keep the buyback's clock at zero: the rotated-out
+     *         observation is always seasoned. Owner / operator may refresh at
+     *         any time (they only ever delay their own buyback).
+     */
+    function updateTwap() public {
+        if (timbsEthPair == address(0)) revert ZeroAddress();
+        (uint256 cumulative, uint32 ts) = _timbsPerEthCumulative();
+        if (twapTimestampLast != 0 && msg.sender != owner() && msg.sender != operator) {
+            uint32 elapsed;
+            unchecked { elapsed = ts - twapTimestampLast; }
+            if (elapsed < MIN_TWAP_PERIOD) revert TwapTooSoon(elapsed, MIN_TWAP_PERIOD);
+        }
+        twapTimbsPerEthCumulativePrev = twapTimbsPerEthCumulativeLast;
+        twapTimestampPrev             = twapTimestampLast;
+        twapTimbsPerEthCumulativeLast = cumulative;
+        twapTimestampLast             = ts;
+        emit TwapUpdated(cumulative, ts);
+    }
+
+    /// @dev TS-016: the observation executeBuyback prices against — the latest
+    ///      one if it is MIN_TWAP_PERIOD old, else the previous one if that is.
+    function _seasonedTwap(uint32 tsNow)
+        internal view returns (uint256 cumulative, uint32 elapsed)
+    {
+        uint32 e;
+        if (twapTimestampLast != 0) {
+            unchecked { e = tsNow - twapTimestampLast; }
+            if (e >= MIN_TWAP_PERIOD) return (twapTimbsPerEthCumulativeLast, e);
+        }
+        if (twapTimestampPrev != 0) {
+            uint32 ep;
+            unchecked { ep = tsNow - twapTimestampPrev; }
+            if (ep >= MIN_TWAP_PERIOD) return (twapTimbsPerEthCumulativePrev, ep);
+        }
+        revert TwapNotReady(e, MIN_TWAP_PERIOD);
+    }
+
+    /// @notice Max downward deviation from the TWAP a buyback will accept (bps).
+    function setBuybackMaxDeviationBps(uint256 bps) external onlyOwner {
+        if (bps > TWAP_BPS) revert InvalidRatio(bps);
+        buybackMaxDeviationBps = bps;
+        emit BuybackMaxDeviationSet(bps);
+    }
+
+    /// @notice Max ETH a single buyback may spend (0 = unlimited).
+    function setBuybackMaxEth(uint256 maxEth) external onlyOwner {
+        buybackMaxEth = maxEth;
+        emit BuybackMaxEthSet(maxEth);
+    }
+
+    /**
+     * @notice Execute a TIMBS buyback using ETH held in treasury.
+     * @dev Buys TIMBS from TIMBS/ETH pair directly. Splits the purchase three
+     *      ways — buybackBurnRatio% burned, buybackReserveRatio% kept as
+     *      reserve, remainder retained as the waterfall slice for the epoch
+     *      keeper. Only the burn leaves the treasury.
+     *
+     *      M7: slippage is floored by an on-chain TWAP, not just the caller's
+     *      minTimbsOut — the effective minimum is max(minTimbsOut, TWAP floor),
+     *      so the buyback can't be sandwiched. A keeper must have called
+     *      updateTwap() at least MIN_TWAP_PERIOD earlier or this reverts
+     *      TwapNotReady. minTimbsOut must be > 0 and ethAmount <= buybackMaxEth.
+     *
+     * @param ethAmount    ETH to spend on buyback.
+     * @param minTimbsOut  Caller's minimum TIMBS out; the TWAP floor may raise it.
+     */
+    function executeBuyback(uint256 ethAmount, uint256 minTimbsOut)
+        external
+        nonReentrant
+        onlyOwner
+    {
+        if (ethAmount == 0)                        revert ZeroAmount();
+        if (ethAmount > address(this).balance)     revert InsufficientETH(ethAmount, address(this).balance);
+        if (timbsEthPair == address(0))            revert ZeroAddress();
+        // M7: never accept a zero floor, and bound the buyback size.
+        if (minTimbsOut == 0)                      revert ZeroAmount();
+        if (buybackMaxEth != 0 && ethAmount > buybackMaxEth) {
+            revert BuybackTooLarge(ethAmount, buybackMaxEth);
+        }
+
+        // Get reserves to calculate amountOut
+        (uint112 r0, uint112 r1,) = ITimbSwapPair(timbsEthPair).getReserves();
+        address token0 = ITimbSwapPair(timbsEthPair).token0();
+
+        // Determine which reserve is ETH and which is TIMBS
+        // ETH side = address(0) represented as WETH — for testnet we handle
+        // native ETH by sending directly to pair before swap
+        uint256 reserveIn;
+        uint256 reserveOut;
+        bool timbsIsToken0 = token0 == address(timbsToken);
+
+        if (timbsIsToken0) {
+            // token0 = TIMBS, token1 = ETH/WETH
+            reserveIn  = uint256(r1); // ETH reserve
+            reserveOut = uint256(r0); // TIMBS reserve
+        } else {
+            // token0 = ETH/WETH, token1 = TIMBS
+            reserveIn  = uint256(r0); // ETH reserve
+            reserveOut = uint256(r1); // TIMBS reserve
+        }
+
+        // Calculate TIMBS out with 0.3% fee
+        uint256 amountInWithFee = ethAmount * 997;
+        uint256 timbsOut = (amountInWithFee * reserveOut) /
+                           (reserveIn * 1_000 + amountInWithFee);
+
+        // M7: derive a TWAP floor on-chain so the buyback can't be sandwiched —
+        // the acceptable minimum is the GREATER of the caller's minTimbsOut and
+        // (TWAP TIMBS/ETH × ethAmount) minus the allowed deviation. The TWAP
+        // observation must be at least MIN_TWAP_PERIOD old.
+        uint256 effectiveMin = minTimbsOut;
+        {
+            (uint256 cumNow, uint32 tsNow) = _timbsPerEthCumulative();
+            (uint256 cumThen, uint32 elapsed) = _seasonedTwap(tsNow); // TS-016
+            uint256 avgPriceUQ;
+            unchecked {
+                // UQ112x112 average TIMBS-per-ETH over the window.
+                avgPriceUQ = (cumNow - cumThen) / elapsed;
+            }
+            uint256 twapExpectedOut = (avgPriceUQ * ethAmount) >> 112; // decode
+            uint256 twapFloor = (twapExpectedOut * (TWAP_BPS - buybackMaxDeviationBps)) / TWAP_BPS;
+            if (twapFloor > effectiveMin) effectiveMin = twapFloor;
+        }
+
+        if (timbsOut < effectiveMin) {
+            revert SlippageExceeded(timbsOut, effectiveMin);
+        }
+
+        if (weth == address(0)) revert ZeroAddress();
+
+        // The pair holds WETH, not native ETH (it has no receive()) — and its
+        // swap() derives the input from its ERC20 balance delta. Wrap first,
+        // then pay the WETH into the pair like any other swap input.
+        IWETH(weth).deposit{value: ethAmount}();
+        IERC20(weth).safeTransfer(timbsEthPair, ethAmount);
+
+        // Measure what THIS swap bought (balance delta), never the treasury's
+        // whole TIMBS balance — pre-existing holdings must not be swept into
+        // the split or mask slippage.
+        uint256 balBefore = timbsToken.balanceOf(address(this));
+
+        if (timbsIsToken0) {
+            ITimbSwapPair(timbsEthPair).swap(timbsOut, 0, address(this));
+        } else {
+            ITimbSwapPair(timbsEthPair).swap(0, timbsOut, address(this));
+        }
+
+        uint256 received = timbsToken.balanceOf(address(this)) - balBefore;
+        if (received < effectiveMin) revert SlippageExceeded(received, effectiveMin);
+
+        // Three-way split: burn / reserve / waterfall. Only the burn leaves
+        // the treasury — `reserve` and `waterfall` both stay in this contract's
+        // TIMBS balance. The split is pure accounting: `waterfall` is emitted so
+        // the epoch keeper can measure it as the per-epoch budget it hands to
+        // farm / staking / boost; `reserve` is the residual that stacks as a
+        // solvency buffer. `waterfall = received − burn − reserve`, so the
+        // event's (bought − burned − reserved) equals exactly the waterfall
+        // slice the keeper distributes.
+        uint256 toBurn      = (received * buybackBurnRatio) / 100;
+        uint256 toReserve   = (received * buybackReserveRatio) / 100;
+        uint256 toWaterfall = received - toBurn - toReserve;
+
+        if (toBurn > 0) {
+            timbsToken.burn(toBurn);
+            totalTimbsBurned += toBurn;
+        }
+
+        totalTimbsToWaterfall += toWaterfall;
+        totalTimbsReserved    += toReserve;
+
+        emit BuybackExecuted(ethAmount, received, toBurn, toWaterfall, toReserve);
+    }
+
+    // ─── Distribution ─────────────────────────────────────────────────────────
+
+    /**
+     * @notice Send ETH from treasury to top up the prize pot.
+     * @dev    Goes through TimbPrize.addToPot, which credits
+     *         currentAccumulatedRewards before depositing into PrizeEscrow.
+     *         Depositing into the escrow directly (the old path) left the ETH
+     *         outside the counter settlement pays from, so it could never
+     *         reach a winner (TS-006). The prize is the one the escrow pays
+     *         for, and it must deposit into this treasury's escrow.
+     * @param amount ETH amount to send.
+     */
+    function distributeToPot(uint256 amount)
+        external
+        nonReentrant
+        onlyOwner
+    {
+        if (amount == 0)                     revert ZeroAmount();
+        if (prizeEscrow == address(0))       revert ZeroAddress();
+        if (amount > address(this).balance)  revert InsufficientETH(amount, address(this).balance);
+
+        _creditPot(amount);
+    }
+
+    /// @dev Send ETH to the pot through TimbPrize.addToPot, which credits the
+    ///      pot counter before depositing into the escrow (TS-006).
+    function _creditPot(uint256 amount) internal {
+        address prize = IPrizeEscrow(prizeEscrow).timbPrize();
+        if (prize == address(0))                             revert ZeroAddress();
+        if (ITimbPrizePot(prize).prizeEscrow() != prizeEscrow) revert EscrowMismatch(prize);
+
+        ITimbPrizePot(prize).addToPot{value: amount}();
+        totalPotFunded += amount;
+
+        emit PotFunded(amount);
+    }
+
+    /**
+     * @notice Split the pools' protocol fee: half to the prize pot, half kept.
+     * @dev    Each pool charges 0.30% and routes 0.05% of it to the protocol as
+     *         LP tokens minted to the factory's feeTo (this treasury). Anyone may
+     *         call this to redeem that fee LP for `pair` (the balance above the
+     *         treasury's own liquidity, polLp) and send the WETH side, unwrapped,
+     *         to the pot. A V2 pool's two sides are equal in value, so the pot
+     *         receives half of the protocol share and the treasury keeps the
+     *         other token (the other half). Only WETH pairs are split.
+     * @param pair A TimbSwap pair containing WETH.
+     */
+    function splitLpFees(address pair) external nonReentrant {
+        if (prizeEscrow == address(0) || weth == address(0)) revert ZeroAddress();
+        address t0 = ITimbSwapPair(pair).token0();
+        address t1 = ITimbSwapPair(pair).token1();
+        if (t0 != weth && t1 != weth) revert NotWethPair(pair);
+        // TS-041: the pair must be the factory's own. A contract that merely
+        // claims a WETH side and returns a chosen amount from burn() could
+        // otherwise make the treasury unwrap its real WETH into the pot and
+        // inflate the fee-split counter. Same round-trip TimbBoostFarm.addPool
+        // uses.
+        if (router == address(0)) revert ZeroAddress();
+        address factory = ITimbSwapRouter(router).factory();
+        if (ITimbSwapFactoryView(factory).getPair(t0, t1) != pair) revert NotFactoryPair(pair);
+
+        uint256 bal = IERC20(pair).balanceOf(address(this));
+        uint256 pol = polLp[pair];
+        uint256 feeLp = bal > pol ? bal - pol : 0;
+        if (feeLp == 0) revert NoFeeLp(pair);
+
+        IERC20(pair).safeTransfer(pair, feeLp);
+        (uint256 a0, uint256 a1) = ITimbSwapPair(pair).burn(address(this));
+
+        (uint256 wethOut, address kept, uint256 keptAmt) = t0 == weth ? (a0, t1, a1) : (a1, t0, a0);
+        if (wethOut > 0) {
+            IWETH(weth).withdraw(wethOut);
+            totalLpFeesToPot += wethOut;
+            _creditPot(wethOut);
+        }
+        emit LpFeesSplit(pair, feeLp, wethOut, kept, keptAmt);
+    }
+
+    /// @dev Record LP the treasury added itself so splitLpFees never redeems
+    ///      it. The pair is looked up through the router's factory.
+    function _recordPol(address a, address b, uint256 liquidity) internal {
+        try ITimbSwapRouter(router).factory() returns (address f) {
+            address p = ITimbSwapFactoryView(f).getPair(a, b);
+            if (p != address(0)) polLp[p] += liquidity;
+        } catch {}
+    }
+
+    /// @notice Owner: correct the protocol-owned LP recorded for `pair` (for
+    ///         example after withdrawing treasury LP with withdrawToken).
+    function setPolLp(address pair, uint256 amount) external onlyOwner {
+        polLp[pair] = amount;
+        emit PolLpSet(pair, amount);
+    }
+
+    /**
+     * @notice Top up TimbStaking rewards directly with TIMBS from treasury.
+     * @dev Treasury must hold TIMBS (transferred from community allocation).
+     * @param timbsAmount TIMBS amount to distribute.
+     * @param duration    Distribution period in seconds.
+     */
+    function distributeToStaking(uint256 timbsAmount, uint256 duration)
+        external
+        nonReentrant
+        onlyOwner
+    {
+        if (timbsAmount == 0)        revert ZeroAmount();
+        if (duration == 0)           revert ZeroAmount();
+        if (timbStaking == address(0)) revert ZeroAddress();
+
+        uint256 bal = timbsToken.balanceOf(address(this));
+        if (timbsAmount > bal) revert ZeroAmount();
+
+        // M5: single funding path. TimbStaking.notifyRewardAmount pulls the TIMBS
+        // itself via transferFrom, so approve it and let it pull — do NOT also
+        // pre-transfer (the old code did both, so it either reverted for lack of
+        // allowance or would have double-spent the amount). Clear the residual
+        // allowance afterwards, mirroring the addLiquidity idiom above.
+        IERC20(address(timbsToken)).forceApprove(timbStaking, timbsAmount);
+        ITimbStaking(timbStaking).notifyRewardAmount(timbsAmount, duration);
+        IERC20(address(timbsToken)).forceApprove(timbStaking, 0);
+        totalTimbsDistributed += timbsAmount; // TS-023: was declared but never written
+
+        emit StakingFunded(timbsAmount, duration);
+    }
+
+    // ─── Protocol-owned liquidity ───────────────────────────────────────────────
+
+    /**
+     * @notice Deploy two treasury-held ERC20s as liquidity. LP tokens are
+     *         minted back to the treasury — protocol-owned, not the owner's.
+     * @dev Both tokens must already sit in this contract (e.g. TIMBS from the
+     *      buyback reserve/waterfall + a stable transferred in). The router
+     *      pulls only what's needed at the pool ratio; any un-deposited dust
+     *      stays here. If the pair doesn't exist, the factory creates it.
+     * @param tokenA          First token.
+     * @param tokenB          Second token.
+     * @param amountADesired  Max tokenA to deposit.
+     * @param amountBDesired  Max tokenB to deposit.
+     * @param amountAMin      Slippage floor on tokenA actually deposited.
+     * @param amountBMin      Slippage floor on tokenB actually deposited.
+     */
+    function provideLiquidity(
+        address tokenA,
+        address tokenB,
+        uint256 amountADesired,
+        uint256 amountBDesired,
+        uint256 amountAMin,
+        uint256 amountBMin
+    ) external nonReentrant onlyOwner {
+        if (router == address(0))                    revert ZeroAddress();
+        if (tokenA == address(0) || tokenB == address(0)) revert ZeroAddress();
+        if (amountADesired == 0 || amountBDesired == 0)   revert ZeroAmount();
+
+        IERC20(tokenA).forceApprove(router, amountADesired);
+        IERC20(tokenB).forceApprove(router, amountBDesired);
+
+        (uint256 amountA, uint256 amountB, uint256 liquidity) =
+            ITimbSwapRouter(router).addLiquidity(
+                tokenA, tokenB,
+                amountADesired, amountBDesired,
+                amountAMin, amountBMin,
+                address(this), block.timestamp
+            );
+
+        // Drop any residual allowance the router didn't consume.
+        IERC20(tokenA).forceApprove(router, 0);
+        IERC20(tokenB).forceApprove(router, 0);
+
+        _recordPol(tokenA, tokenB, liquidity);
+        emit LiquidityProvided(tokenA, tokenB, amountA, amountB, liquidity);
+    }
+
+    /**
+     * @notice Deploy treasury-held TIMBS (or any token) + treasury ETH as
+     *         liquidity. LP tokens are minted back to the treasury.
+     * @dev Uses native ETH held here (unwrap WETH fee revenue first via
+     *      `unwrapWeth` if needed). Router refunds any excess ETH to the
+     *      treasury. Pairs against WETH under the hood.
+     * @param token               Token to pair with ETH.
+     * @param amountTokenDesired  Max token to deposit.
+     * @param ethAmount           ETH to deposit (≤ treasury balance).
+     * @param amountTokenMin      Slippage floor on token deposited.
+     * @param amountETHMin        Slippage floor on ETH deposited.
+     */
+    function provideLiquidityETH(
+        address token,
+        uint256 amountTokenDesired,
+        uint256 ethAmount,
+        uint256 amountTokenMin,
+        uint256 amountETHMin
+    ) external nonReentrant onlyOwner {
+        if (router == address(0))            revert ZeroAddress();
+        if (token == address(0))             revert ZeroAddress();
+        if (amountTokenDesired == 0 || ethAmount == 0) revert ZeroAmount();
+        if (ethAmount > address(this).balance) revert InsufficientETH(ethAmount, address(this).balance);
+
+        IERC20(token).forceApprove(router, amountTokenDesired);
+
+        (uint256 amountToken, uint256 amountETH, uint256 liquidity) =
+            ITimbSwapRouter(router).addLiquidityETH{value: ethAmount}(
+                token, amountTokenDesired, amountTokenMin, amountETHMin,
+                address(this), block.timestamp
+            );
+
+        IERC20(token).forceApprove(router, 0);
+
+        _recordPol(token, weth, liquidity);
+        emit LiquidityProvided(token, weth, amountToken, amountETH, liquidity);
+    }
+
+    /**
+     * @notice Withdraw any ERC20 held by the treasury (owner only).
+     * @dev Protocol swap fees arrive as the swap's INPUT token (TIMBS, WETH,
+     *      stables…), not ETH — this is the exit for everything the
+     *      buyback/distribute flows don't cover, and the rescue that v1/v2
+     *      lacked (v1 stranded its TIMBS fee balance permanently).
+     */
+    function withdrawToken(address token, address to, uint256 amount)
+        external
+        nonReentrant
+        onlyOwner
+    {
+        if (token == address(0) || to == address(0)) revert ZeroAddress();
+        if (amount == 0) revert ZeroAmount();
+        IERC20(token).safeTransfer(to, amount);
+        emit OperationalWithdraw(to, amount);
+    }
+
+    /**
+     * @notice Unwrap WETH fee revenue into ETH — feeds executeBuyback /
+     *         distributeToPot, which spend native ETH. Owner or operator: this
+     *         only converts WETH the treasury already holds into ETH it already
+     *         holds; it moves nothing out, so the operator may run it.
+     */
+    function unwrapWeth(uint256 amount) external nonReentrant onlyOwnerOrOperator {
+        if (weth == address(0)) revert ZeroAddress();
+        if (amount == 0) revert ZeroAmount();
+        IWETH(weth).withdraw(amount);
+    }
+
+    /**
+     * @notice Withdraw ETH for operational expenses.
+     * @dev The timelock owner is unbounded. The operator (M1) is rate-limited to
+     *      `operatorEthCap` per rolling `operatorPeriod`, so a compromised
+     *      operator key can never drain the treasury in one move — large or
+     *      urgent spend goes through the timelock owner. Cap defaults to 0.
+     */
+    function withdrawOperational(address to, uint256 amount)
+        external
+        nonReentrant
+        onlyOwnerOrOperator
+    {
+        if (to == address(0))              revert ZeroAddress();
+        if (amount == 0)                   revert ZeroAmount();
+        if (amount > address(this).balance) revert InsufficientETH(amount, address(this).balance);
+
+        // Owner (timelock) is unbounded; the operator is capped per window.
+        if (msg.sender != owner()) {
+            // Lazily roll the window forward.
+            if (block.timestamp >= operatorWindowStart + operatorPeriod) {
+                operatorWindowStart   = block.timestamp;
+                operatorSpentInWindow = 0;
+            }
+            uint256 remaining = operatorEthCap > operatorSpentInWindow
+                ? operatorEthCap - operatorSpentInWindow
+                : 0;
+            if (amount > remaining) revert OperatorCapExceeded(amount, remaining);
+            operatorSpentInWindow += amount;
+        }
+
+        (bool ok,) = payable(to).call{value: amount}("");
+        if (!ok) revert TransferFailed();
+
+        emit OperationalWithdraw(to, amount);
+    }
+
+    // ─── Owner: Config ────────────────────────────────────────────────────────
+
+    /**
+     * @notice Set buyback burn ratio (0–100). `burn + reserve` must stay ≤ 100;
+     *         the remainder is the waterfall slice.
+     */
+    function setBuybackBurnRatio(uint256 _ratio) external onlyOwner {
+        if (_ratio > 100 || _ratio + buybackReserveRatio > 100) revert InvalidRatio(_ratio);
+        buybackBurnRatio = _ratio;
+        emit BuybackBurnRatioSet(_ratio);
+    }
+
+    /**
+     * @notice Set buyback reserve ratio (0–100) — the slice kept back as a
+     *         standing buffer. `burn + reserve` must stay ≤ 100; the remainder
+     *         is the waterfall slice the epoch keeper distributes.
+     */
+    function setBuybackReserveRatio(uint256 _ratio) external onlyOwner {
+        if (_ratio > 100 || buybackBurnRatio + _ratio > 100) revert InvalidRatio(_ratio);
+        buybackReserveRatio = _ratio;
+        emit BuybackReserveRatioSet(_ratio);
+    }
+
+    function setTimbStaking(address _staking) external onlyOwner {
+        if (_staking == address(0)) revert ZeroAddress();
+        timbStaking = _staking;
+        emit StakingSet(_staking);
+    }
+
+    function setPrizeEscrow(address _escrow) external onlyOwner {
+        if (_escrow == address(0)) revert ZeroAddress();
+        address old = prizeEscrow;
+        if (old != address(0) && old != _escrow) {
+            authorisedFeeSenders[old] = false;
+            emit FeeSenderSet(old, false);
+        }
+        prizeEscrow = _escrow;
+        authorisedFeeSenders[_escrow] = true;
+        emit PrizeEscrowSet(_escrow);
+        emit FeeSenderSet(_escrow, true);
+    }
+
+    function setTimbsEthPair(address _pair) external onlyOwner {
+        if (_pair == address(0)) revert ZeroAddress();
+        timbsEthPair = _pair;
+        emit PairSet(_pair);
+    }
+
+    function setRouter(address _router) external onlyOwner {
+        if (_router == address(0)) revert ZeroAddress();
+        router = _router;
+        emit RouterSet(_router);
+    }
+
+    function setWeth(address _weth) external onlyOwner {
+        if (_weth == address(0)) revert ZeroAddress();
+        weth = _weth;
+    }
+
+    function setStakingDistributionPeriod(uint256 _period) external onlyOwner {
+        if (_period == 0) revert ZeroAmount();
+        stakingDistributionPeriod = _period;
+    }
+
+    /// @notice Set (or clear, with address(0)) the rate-limited operator (M1).
+    function setOperator(address _operator) external onlyOwner {
+        operator = _operator;
+        emit OperatorSet(_operator);
+    }
+
+    /// @notice Set the operator's per-window ETH withdrawal cap and window length.
+    ///         Setting the cap to 0 disables operator withdrawals entirely.
+    function setOperatorEthCap(uint256 _cap, uint256 _period) external onlyOwner {
+        if (_period == 0) revert ZeroAmount();
+        operatorEthCap = _cap;
+        operatorPeriod = _period;
+        emit OperatorEthCapSet(_cap, _period);
+    }
+
+    function setFeeSender(address sender, bool authorised) external onlyOwner {
+        if (sender == address(0)) revert ZeroAddress();
+        authorisedFeeSenders[sender] = authorised;
+        emit FeeSenderSet(sender, authorised);
+    }
+
+    // ─── View ─────────────────────────────────────────────────────────────────
+
+    /**
+     * @notice Returns treasury ETH balance.
+     */
+    function ethBalance() external view returns (uint256) {
+        return address(this).balance;
+    }
+
+    /**
+     * @notice Returns treasury TIMBS balance.
+     */
+    function timbsBalance() external view returns (uint256) {
+        return timbsToken.balanceOf(address(this));
+    }
+
+    /**
+     * @notice Returns lifetime treasury stats.
+     */
+    function getStats()
+        external
+        view
+        returns (
+            uint256 feesReceived,
+            uint256 timbsBurned,
+            uint256 timbsDistributed,
+            uint256 potFunded
+        )
+    {
+        return (
+            totalFeesReceived,
+            totalTimbsBurned,
+            totalTimbsDistributed,
+            totalPotFunded
+        );
+    }
+
+    /// @dev Accept ETH from fee senders and direct deposits; only authorised
+    ///      senders count toward totalFeesReceived.
+    ///      WETH.withdraw refunds under a 2300-gas stipend — too little for
+    ///      the accounting SSTORE+event, so that path returns early (it's an
+    ///      internal conversion, not new revenue).
+    receive() external payable {
+        if (msg.sender == weth) return;
+        if (msg.value == 0) return;
+        // TS-032: the router's plain ETH is never fee revenue. Its ETH-side
+        // fees arrive as WETH; the only plain ETH it sends here is the
+        // excess-ETH refund from provideLiquidityETH, which must not inflate
+        // totalFeesReceived. Other authorised senders (the escrow's protocol
+        // cut) still count.
+        if (authorisedFeeSenders[msg.sender] && msg.sender != router) {
+            totalFeesReceived += msg.value;
+            emit FeesReceived(msg.sender, msg.value);
+        } else {
+            emit EthDeposited(msg.sender, msg.value);
+        }
+    }
+}
